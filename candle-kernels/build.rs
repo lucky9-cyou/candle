@@ -4,7 +4,7 @@ fn main() {
     println!("cargo:rerun-if-changed=src/cuda_utils.cuh");
     println!("cargo:rerun-if-changed=src/binary_op_macros.cuh");
 
-    let builder = bindgen_cuda::Builder::default();
+    let builder = bindgen_cuda::Builder::default().arg("-ccbin=/usr/bin/gcc-13");
     println!("cargo:info={builder:?}");
     let bindings = builder.build_ptx().unwrap();
     bindings.write("src/lib.rs").unwrap();
