@@ -1864,33 +1864,22 @@ impl BackendDevice for MetalDevice {
     fn new(ordinal: usize) -> Result<Self> {
         let device = metal::Device::all().swap_remove(ordinal);
         let command_queue = device.new_command_queue();
-        let command_buffer = command_queue.new_command_buffer().to_owned();
-        command_buffer.enqueue();
-        let command_buffer = Arc::new(RwLock::new(command_buffer));
-        let command_buffer_index = Arc::new(RwLock::new(0));
         let kernels = Arc::new(Kernels::new());
-        let buffers = Arc::new(RwLock::new(HashMap::new()));
         let use_mlx_mm = match std::env::var("CANDLE_USE_MLX_MM").as_deref() {
             Ok("false") | Ok("False") | Ok("FALSE") | Ok("0") | Err(_) => false,
             Ok(_) => true,
-        };
-        let compute_per_buffer = match std::env::var("CANDLE_METAL_COMPUTE_PER_BUFFER") {
-            Ok(val) => val.parse()?,
-            _ => 50,
         };
         let seed = Arc::new(Mutex::new(device.new_buffer_with_data(
             [299792458].as_ptr() as *const c_void,
             4,
             MTLResourceOptions::StorageModeManaged,
         )));
+        let commands = device::Commands::new(command_queue)?;
         Ok(Self {
             id: DeviceId::new(),
             device,
-            command_queue,
-            command_buffer,
-            command_buffer_index,
-            compute_per_buffer,
-            buffers,
+            commands: Arc::new(RwLock::new(commands)),
+            buffers: Arc::new(RwLock::new(HashMap::new())),
             kernels,
             seed,
             use_mlx_mm,
@@ -1928,10 +1917,38 @@ impl BackendDevice for MetalDevice {
         ))
     }
 
-    fn ones_impl(&self, shape: &Shape, dtype: DType) -> Result<Self::Storage> {
-        // TODO Is there a faster way ?
-        let cpu_storage = crate::cpu_backend::CpuDevice.ones_impl(shape, dtype)?;
-        self.storage_from_cpu_storage(&cpu_storage)
+    fn ones_impl(&self, shape: &Shape, dtype: DType) -> Result<MetalStorage> {
+        let name = match dtype {
+            DType::U8 => "fill_u8",
+            DType::U32 => "fill_u32",
+            DType::I64 => "fill_i64",
+            DType::F16 => "fill_f16",
+            DType::BF16 => "fill_bf16",
+            DType::F32 => "fill_f32",
+            DType::F64 => {
+                let cpu_storage = crate::cpu_backend::CpuDevice.ones_impl(shape, dtype)?;
+                return self.storage_from_cpu_storage(&cpu_storage);
+            }
+        };
+        let buffer = self.new_buffer(shape.elem_count(), dtype, "alloc-ones")?;
+        let command_buffer = self.command_buffer()?;
+        candle_metal_kernels::call_const_fill(
+            &self.device,
+            &command_buffer,
+            &self.kernels,
+            name,
+            shape.elem_count(),
+            &buffer,
+            1.,
+        )
+        .map_err(MetalError::from)?;
+
+        Ok(MetalStorage::new(
+            buffer,
+            self.clone(),
+            shape.elem_count(),
+            dtype,
+        ))
     }
 
     fn storage_from_slice<T: crate::WithDType>(&self, s: &[T]) -> Result<Self::Storage> {
